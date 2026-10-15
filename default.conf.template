@@ -4,6 +4,16 @@ server {
     root   /usr/share/nginx/html;
     index  index.html;
 
+    # Явная кодировка в заголовке: кириллица не зависит от того, найдёт ли
+    # браузер <meta charset> (и config.js/app.js, открытые напрямую, тоже).
+    charset utf-8;
+    charset_types text/css text/javascript application/javascript application/json;
+
+    # Без этого телефоны держат в кэше старые index.html/app.js, и после
+    # деплоя бригадиры работают со старой версией. no-cache = «каждый раз
+    # спроси сервер»; неизменившийся файл приходит ответом 304 без тела.
+    add_header Cache-Control "no-cache" always;
+
     location / {
         try_files $uri $uri/ /index.html;
     }

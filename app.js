@@ -7,25 +7,33 @@ const formatApiDetail = detail => {
   if (Array.isArray(detail)) return detail.map(x => x.msg || x.message || JSON.stringify(x)).join("; ");
   return detail.message || JSON.stringify(detail);
 };
+/* Ошибка несёт status (HTTP-код) или network=true — по ним решаем, повторять
+   ли запрос: сеть на телефоне пропадает постоянно, а 4xx повтором не лечится. */
 const api = async (p, opt) => {
-  let r;
+  let r, text;
   try {
     r = await fetch(API_BASE + "/api" + p, opt);
+    text = await r.text();
   } catch (e) {
-    throw new Error("Нет связи с сервером: " + e.message);
+    const err = new Error("Нет связи с сервером");
+    err.network = true;
+    throw err;
   }
-  const text = await r.text();
   let data = null;
   if (text) {
     try { data = JSON.parse(text); } catch (e) {}
   }
   if (!r.ok) {
-    throw new Error(formatApiDetail(data && data.detail) || formatApiDetail(data) || text || r.statusText || `HTTP ${r.status}`);
+    const err = new Error(formatApiDetail(data && data.detail) || formatApiDetail(data) || text || r.statusText || `HTTP ${r.status}`);
+    err.status = r.status;
+    throw err;
   }
   return data;
 };
-const jpost = (p, body) => api(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-const jpatch = (p, body) => api(p, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+const jsend = method => (p, body, extra) =>
+  api(p, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), ...extra });
+const jpost = jsend("POST"), jpatch = jsend("PATCH"), jput = jsend("PUT");
+const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const plural = (n, one, few, many) => {
   const m10 = n % 10, m100 = n % 100;
@@ -37,36 +45,117 @@ const objLabel = k => k === "sulphide_2" ? "Сульфидная фабрика 
 const objShort = k => k === "sulphide_2" ? "Сульфид 2" : "Сульфид 1";
 const taskLabel = k => k === "demontazh" ? "Демонтаж лесов" : "Монтаж лесов";
 const taskShort = k => k === "demontazh" ? "Демонтаж" : "Монтаж";
+const normName = s => String(s || "").toLowerCase().replace(/ё/g, "е").replace(/\s+/g, " ").trim();
+const workerNames = b => (b.workers || []).map(w => (w.full_name || "").trim()).filter(Boolean);
 
-/* ---------- отложенное сохранение ----------
-   Бэкенд берёт ФИО из БД, а не из тела запроса на отправку. Поэтому перед
-   стартом задачи все отложенные сохранения обязаны долететь — иначе уйдёт
-   предыдущее значение поля. */
-const pendingSavers = new Set();
-const pendingCreates = new Set();
-function debouncedSave(fn, ms = 500) {
-  let timer = null, inflight = null;
-  const fire = () => {
-    timer = null;
-    pendingSavers.delete(saver);
-    inflight = Promise.resolve().then(fn).catch(() => {});
-    return inflight;
-  };
-  const saver = () => {
-    if (timer) clearTimeout(timer);
-    pendingSavers.add(saver);
-    timer = setTimeout(fire, ms);
-  };
-  saver.flush = () => (timer ? (clearTimeout(timer), fire()) : (inflight || Promise.resolve()));
-  // Нужна, когда объект удалили: иначе отложенный PATCH прилетит на уже
-  // несуществующий id и вернёт 404.
-  saver.cancel = () => { if (timer) clearTimeout(timer); timer = null; pendingSavers.delete(saver); };
-  return saver;
+// «сегодня 08:12» / «вчера 17:40» / «14.10 08:12»
+function fmtWhen(iso) {
+  const d = iso ? new Date(iso) : null;
+  if (!d || isNaN(d)) return "";
+  const hm = d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  const day0 = x => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const days = Math.round((day0(new Date()) - day0(d)) / 864e5);
+  if (days === 0) return "сегодня " + hm;
+  if (days === 1) return "вчера " + hm;
+  return d.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" }) + " " + hm;
 }
-async function flushSaves() {
-  await Promise.all([...pendingCreates]);
-  await Promise.all([...pendingSavers].map(s => s.flush()));
-  await Promise.all([...pendingCreates]);
+
+/* ---------- сохранение правок ----------
+   Раньше каждое поле уходило отложенным запросом, о котором больше никто не
+   знал: выход из бригады перечитывал список с сервера раньше, чем правка туда
+   долетала, — и при следующем открытии на экране стоял старый состав. Теперь:
+   - кэш на устройстве меняется сразу при наборе, экран от сети не зависит;
+   - запросы одного сохранителя идут строго по очереди и несут актуальное
+     значение (медленный старый запрос не перетрёт новый);
+   - при уходе с экрана, сворачивании и закрытии вкладки всё недосохранённое
+     уходит немедленно, с keepalive — такой запрос переживает закрытие страницы;
+   - сбой сети правку не теряет: повторяем, а в шапке видно «Не сохранено». */
+const savers = new Set();
+function makeSaver(blockId, send, ms = 400) {
+  let timer = null, dirty = false, chain = null, retries = 0;
+  const s = { blockId, failed: false };
+  const settle = () => { if (!dirty && !chain) savers.delete(s); updateSaveState(); };
+  const run = urgent => {
+    dirty = false;
+    const p = Promise.resolve()
+      .then(() => send(urgent ? { keepalive: true } : {}))
+      .then(() => { retries = 0; s.failed = false; }, e => {
+        if (e.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429) {
+          // Ошибка в самих данных (бригаду удалили, слишком длинное ФИО) — повтор не поможет.
+          s.failed = false;
+          if (blocksCache.some(b => b.id === blockId)) toast("Не сохранено: " + e.message, "error", 5000);
+          return;
+        }
+        s.failed = true;
+        if (!dirty) {
+          dirty = true; retries++;
+          clearTimeout(timer);
+          timer = setTimeout(() => s.flush(), Math.min(15000, 1000 * 2 ** retries));
+        }
+      })
+      .finally(() => { if (chain === p) chain = null; settle(); });
+    chain = p;
+    updateSaveState();
+    return p;
+  };
+  s.schedule = () => {
+    dirty = true; savers.add(s);
+    clearTimeout(timer); timer = setTimeout(() => s.flush(), ms);
+    updateSaveState();
+  };
+  // urgent: страница уходит — не ждём предыдущий запрос, шлём сразу.
+  s.flush = (urgent = false) => {
+    clearTimeout(timer); timer = null;
+    if (!dirty) return chain || Promise.resolve();
+    if (chain && !urgent) return chain.then(() => s.flush());
+    return run(urgent);
+  };
+  s.cancel = () => { clearTimeout(timer); timer = null; dirty = false; s.failed = false; savers.delete(s); updateSaveState(); };
+  Object.defineProperty(s, "busy", { get: () => dirty || !!chain });
+  return s;
+}
+const flushAll = (urgent = false) => Promise.all([...savers].map(s => s.flush(urgent)));
+const busyBlockIds = () => new Set([...savers].filter(s => s.busy || s.failed).map(s => s.blockId));
+
+// Сохранители живут по одному на бригаду и читают значения из кэша, а не из
+// полей ввода: поле названия общее для всех бригад, и отложенное сохранение
+// бригады A не должно записать в неё название открытой следом бригады B.
+const blockSavers = new Map();
+function saversFor(id) {
+  let s = blockSavers.get(id);
+  if (s) return s;
+  const cur = () => blocksCache.find(x => x.id === id);
+  s = {
+    block: makeSaver(id, opts => {
+      const b = cur();
+      if (!b) return;
+      return jpatch("/blocks/" + id, { name: b.name, company: b.company, task: b.task, object_key: b.object_key }, opts);
+    }),
+    workers: makeSaver(id, opts => {
+      const b = cur();
+      if (!b) return;
+      return jput("/blocks/" + id + "/workers", { names: workerNames(b) }, opts);
+    }),
+  };
+  blockSavers.set(id, s);
+  return s;
+}
+
+let saveStateTimer = null;
+function updateSaveState() {
+  const st = $("saveState");
+  if (!st) return;
+  const list = [...savers];
+  clearTimeout(saveStateTimer);
+  const show = (cls, html, title) => { st.className = cls; st.innerHTML = html; st.title = title; st.setAttribute("aria-label", title); };
+  if (list.some(s => s.failed)) {
+    show("err", ICONS.warn + "<span>Не сохранено</span>", "Нет связи с сервером. Повторю сам, или нажмите, чтобы повторить сейчас.");
+  } else if (list.some(s => s.busy)) {
+    show("busy", ICONS.spin, "Сохранение…");
+  } else if (st.innerHTML) {
+    show("ok", ICONS.done, "Сохранено");
+    saveStateTimer = setTimeout(() => { st.className = "ok idle"; }, 1500);
+  }
 }
 
 /* ---------- черновик рабочего места ----------
@@ -76,6 +165,15 @@ const draft = {
   key: id => "slam.workplace." + id,
   get(id) { try { return localStorage.getItem(this.key(id)) || ""; } catch (e) { return ""; } },
   set(id, v) { try { v ? localStorage.setItem(this.key(id), v) : localStorage.removeItem(this.key(id)); } catch (e) {} },
+};
+// Последние отправленные рабочие места — подсказки в один тап.
+const recentWp = {
+  key: id => "slam.recentWorkplaces." + id,
+  get(id) { try { return JSON.parse(localStorage.getItem(this.key(id)) || "[]"); } catch (e) { return []; } },
+  add(id, v) {
+    try { localStorage.setItem(this.key(id), JSON.stringify([v, ...this.get(id).filter(x => x !== v)].slice(0, 4))); } catch (e) {}
+  },
+  clear(id) { try { localStorage.removeItem(this.key(id)); } catch (e) {} },
 };
 
 /* ---------- SVG-иконки ---------- */
@@ -93,13 +191,22 @@ const ICONS = {
 };
 
 /* ---------- тосты ---------- */
-function toast(message, type = "info", ms = 3200) {
-  const box = document.getElementById("toasts");
+function toast(message, type = "info", ms = 3200, action = null) {
+  const box = $("toasts");
   const t = document.createElement("div");
   t.className = "toast " + (type === "error" ? "err" : type === "ok" ? "ok" : "");
-  t.textContent = message;
+  const msg = document.createElement("span");
+  msg.className = "t-msg"; msg.textContent = message;
+  t.appendChild(msg);
+  const remove = () => { t.style.opacity = "0"; t.style.transition = "opacity .25s"; setTimeout(() => t.remove(), 250); };
+  if (action) {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "t-act"; b.textContent = action.label;
+    b.onclick = () => { action.run(); remove(); };
+    t.appendChild(b);
+  }
   box.appendChild(t);
-  setTimeout(() => { t.style.opacity = "0"; t.style.transition = "opacity .25s"; setTimeout(() => t.remove(), 250); }, ms);
+  setTimeout(remove, ms);
 }
 
 /* ---------- модалки ---------- */
@@ -109,6 +216,7 @@ function modal(buildBody) {
     overlay.className = "overlay";
     const box = document.createElement("div");
     box.className = "modal";
+    box.setAttribute("role", "dialog"); box.setAttribute("aria-modal", "true");
     overlay.appendChild(box);
     const close = (val) => {
       document.removeEventListener("keydown", onKey);
@@ -127,7 +235,7 @@ function promptModal({ title, label, value = "", placeholder = "", okText = "С�
   return modal((box, close) => {
     box.innerHTML = `<h3>${esc(title)}</h3>
       <label style="margin-top:4px">${esc(label)}</label>
-      <input type="text" class="m-input" placeholder="${esc(placeholder)}">
+      <input type="text" class="m-input" placeholder="${esc(placeholder)}" maxlength="200">
       <div class="actions"><button type="button" class="ghost m-cancel">Отмена</button><button type="button" class="m-ok">${esc(okText)}</button></div>`;
     const input = box.querySelector(".m-input");
     input.value = value;
@@ -138,12 +246,14 @@ function promptModal({ title, label, value = "", placeholder = "", okText = "С�
     setTimeout(() => { input.focus(); input.select(); }, 60);
   });
 }
-function confirmModal({ title, message = "", summaryRows = null, okText = "OK", danger = false }) {
+function confirmModal({ title, message = "", list = null, warning = "", summaryRows = null, okText = "OK", danger = false }) {
   return modal((box, close) => {
     let summary = "";
     if (summaryRows) summary = `<div class="summary">` + summaryRows.map(([k, v]) =>
       `<div><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("") + `</div>`;
-    box.innerHTML = `<h3>${esc(title)}</h3>${message ? `<p>${esc(message)}</p>` : ""}${summary}
+    const names = list ? `<ol class="names">${list.map(n => `<li>${esc(n)}</li>`).join("")}</ol>` : "";
+    box.innerHTML = `<h3>${esc(title)}</h3>${message ? `<p>${esc(message)}</p>` : ""}${names}`
+      + `${warning ? `<div class="m-warn">${esc(warning)}</div>` : ""}${summary}
       <div class="actions"><button type="button" class="ghost m-cancel">Отмена</button>
       <button type="button" class="m-ok" style="background:${danger ? "var(--danger)" : "var(--accent)"}">${esc(okText)}</button></div>`;
     box.querySelector(".m-ok").onclick = () => close(true);
@@ -154,25 +264,54 @@ function confirmModal({ title, message = "", summaryRows = null, okText = "OK", 
 
 /* ---------- состояние ---------- */
 let blocksCache = [];
+let loadState = "loading";       // loading | ok | error — пока список ни разу не пришёл
+let loadError = "";
+let loadSeq = 0, appliedSeq = 0;
 let currentBlockId = null;
-let answersTpl = null;          // шаблон сценария с бэкенда (грузится один раз)
+let detailEl = null;             // карточка открытой бригады
+let answersTpl = null;           // шаблон сценария с бэкенда (грузится один раз)
 const selected = new Set();
 let selectionMode = false;
 let lastLongPress = 0;
 
+/* ---------- навигация ----------
+   Открытая бригада живёт в адресе (#/b/34): если телефон выгрузил вкладку,
+   пока шла отправка, после перезагрузки бригадир вернётся туда же и увидит
+   её ход, а не главный экран. */
+let enteredFromList = false;
+const routeId = () => { const m = location.hash.match(/^#\/b\/(\d+)$/); return m ? +m[1] : null; };
+function route() {
+  const id = routeId();
+  if (id != null) openDetail(id); else showList();
+}
+function goDetail(id) {
+  enteredFromList = true;
+  if (routeId() === id) openDetail(id); else location.hash = "#/b/" + id;
+}
+function goList() {
+  if (enteredFromList) { enteredFromList = false; history.back(); return; }   // hashchange -> showList
+  history.replaceState(null, "", location.pathname + location.search);
+  showList();
+}
+
 /* ---------- режим выбора (долгое нажатие в списке) ---------- */
 function setSelecting(on) {
+  if (on === selectionMode) return;
   selectionMode = on;
   document.body.classList.toggle("selecting", on);
-  if (!on) {
+  if (on) {
+    // своя запись в истории: системная «Назад» выходит из выбора, а не из приложения
+    history.pushState({ sel: 1 }, "");
+  } else {
     selected.clear();
     document.querySelectorAll(".row.selected").forEach(c => c.classList.remove("selected"));
+    if (history.state && history.state.sel) history.back();
   }
   updateSelbar();
 }
 function updateSelbar() {
-  document.getElementById("selCount").textContent = selected.size;
-  document.getElementById("selDelete").disabled = selected.size === 0;
+  $("selCount").textContent = selected.size;
+  $("selDelete").disabled = selected.size === 0;
 }
 function toggleBlockSelect(id, el) {
   if (selected.has(id)) { selected.delete(id); el.classList.remove("selected"); }
@@ -191,39 +330,78 @@ function attachLongPress(el, onLong, ms = 500) {
   el.addEventListener("pointermove", e => { if (timer && (Math.abs(e.clientX - sx) > 10 || Math.abs(e.clientY - sy) > 10)) cancel(); }, { passive: true });
   ["pointerup", "pointercancel", "pointerleave"].forEach(ev => el.addEventListener(ev, cancel, { passive: true }));
 }
+function forgetBlock(id) {
+  const s = blockSavers.get(id);
+  if (s) { s.block.cancel(); s.workers.cancel(); blockSavers.delete(id); }
+  blocksCache = blocksCache.filter(b => b.id !== id);
+  draft.set(id, ""); recentWp.clear(id);
+}
 async function deleteSelected() {
   if (!selected.size) return;
   const ids = [...selected], n = ids.length;
   const ok = await confirmModal({
-    title: `Удалить ${n} ${plural(n, "блок", "блока", "блоков")}?`,
+    title: `Удалить ${n} ${plural(n, "бригаду", "бригады", "бригад")}?`,
     message: "Выбранные бригады и все их сохранённые ФИО будут удалены без возможности восстановления.",
     okText: `Удалить ${n}`, danger: true,
   });
   if (!ok) return;
   let fail = 0;
   for (const id of ids) {
-    try { await api("/blocks/" + id, { method: "DELETE" }); draft.set(id, ""); } catch (e) { fail++; }
+    try { await api("/blocks/" + id, { method: "DELETE" }); forgetBlock(id); } catch (e) { fail++; }
   }
   setSelecting(false);
-  await load();
+  renderList();
+  load();
   if (fail) toast(`Удалено ${n - fail}, с ошибкой ${fail}`, "error", 5000);
   else toast(`Удалено: ${n}`, "ok");
 }
 
 /* ---------- список бригад (главный экран) ---------- */
 async function load() {
+  const seq = ++loadSeq;
+  let fresh;
   try {
-    blocksCache = await api("/blocks");
-    renderList();
+    fresh = await api("/blocks");
   } catch (e) {
-    toast("Не удалось загрузить данные: " + e.message, "error", 5000);
+    if (seq < appliedSeq) return;
+    if (loadState !== "ok") { loadState = "error"; loadError = e.message; renderList(); }
+    else if (!document.hidden) toast("Не удалось обновить список: " + e.message, "error", 4000);
+    return;
   }
+  if (seq < appliedSeq) return;               // уже применён ответ на более новый запрос
+  appliedSeq = seq;
+  // Открытую бригаду и ту, чьи правки ещё не долетели, берём из кэша
+  // устройства: ответ сервера мог быть собран раньше, чем правка дошла.
+  const keep = busyBlockIds();
+  if (currentBlockId != null) keep.add(currentBlockId);
+  blocksCache = fresh.map(f => {
+    const mine = keep.has(f.id) && blocksCache.find(x => x.id === f.id);
+    const b = mine || f;
+    const w = watchers.get(f.id);
+    b.last_job = w && w.job ? summarize(w.job) : f.last_job;
+    return b;
+  });
+  loadState = "ok";
+  // Идущие отправки (начатые до перезагрузки или с другого телефона) — под наблюдение.
+  for (const b of blocksCache) {
+    if (isActive(b.last_job) && !watchers.has(b.id)) watchJob(b.id, { id: b.last_job.id });
+  }
+  renderList();
 }
 function renderList() {
-  const root = document.getElementById("listView");
+  const root = $("listView");
   if (!blocksCache.length) {
-    root.innerHTML = `<div class="empty">${ICONS.doc}<div>
-      Пока нет ни одной бригады.<br>Нажмите <b>«+ Блок»</b>, чтобы создать первую.</div></div>`;
+    if (loadState === "loading") {
+      root.innerHTML = `<div class="empty">${ICONS.spin}<div>Загрузка…</div></div>`;
+    } else if (loadState === "error") {
+      root.innerHTML = `<div class="empty">${ICONS.warn}<div>Не удалось загрузить бригады.<br>
+        <span class="muted">${esc(loadError)}</span></div>
+        <button type="button" class="ghost retry">Повторить</button></div>`;
+      root.querySelector(".retry").onclick = () => { loadState = "loading"; renderList(); load(); };
+    } else {
+      root.innerHTML = `<div class="empty">${ICONS.doc}<div>
+        Пока нет ни одной бригады.<br>Нажмите <b>«+ Бригада»</b>, чтобы создать первую.</div></div>`;
+    }
     return;
   }
   const frag = document.createDocumentFragment();
@@ -231,11 +409,13 @@ function renderList() {
   root.replaceChildren(frag);
 }
 function renderRow(b) {
-  const el = document.getElementById("rowTpl").content.cloneNode(true).querySelector(".row");
+  const el = $("rowTpl").content.cloneNode(true).querySelector(".row");
+  el.dataset.id = b.id;
   el.querySelector(".row-name").textContent = b.name || "Без названия";
-  const n = b.workers.length;
+  const n = workerNames(b).length;
   el.querySelector(".row-sub").textContent =
     `${n} ${plural(n, "работник", "работника", "работников")} · ${objShort(b.object_key)} · ${taskShort(b.task)}`;
+  paintRowJob(el, b.last_job);
   if (selected.has(b.id)) el.classList.add("selected");
   attachLongPress(el, () => {
     if (!selectionMode) setSelecting(true);
@@ -245,56 +425,98 @@ function renderRow(b) {
   el.addEventListener("click", () => {
     if (Date.now() - lastLongPress < 500) return;
     if (selectionMode) { toggleBlockSelect(b.id, el); return; }
-    openDetail(b.id);
+    goDetail(b.id);
   });
+  el.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); el.click(); } });
   return el;
+}
+// Строка под названием бригады: идёт ли отправка и чем кончилась последняя.
+function jobBadge(s) {
+  if (!s) return null;
+  const when = fmtWhen(s.finished_at || s.created_at);
+  if (s.status === "queued") return ["run", ICONS.clock, "В очереди на отправку"];
+  if (s.status === "running") return ["run", ICONS.spin, `Отправляется: ${s.done} из ${s.total}`];
+  if (!s.submit) return ["", ICONS.done, `Проверка без отправки · ${when}`];
+  if (s.status === "error") return ["bad", ICONS.err, `Прервано: отправлено ${s.sent} из ${s.total} · ${when}`];
+  if (s.failed || s.unconfirmed) return ["warn", ICONS.warn, `Отправлено ${s.sent} из ${s.total} · ${when}`];
+  return ["ok", ICONS.ok, `Отправлено ${s.sent} из ${s.total} · ${when}`];
+}
+function paintRowJob(row, s) {
+  const box = row.querySelector(".row-job");
+  const badge = jobBadge(s);
+  box.hidden = !badge;
+  if (!badge) return;
+  box.className = "row-job " + badge[0];
+  box.innerHTML = badge[1] + `<span>${esc(badge[2])}</span>`;
 }
 
 /* ---------- экран одной бригады (detail) ---------- */
 function showList() {
-  currentBlockId = null;
+  currentBlockId = null; detailEl = null;
   document.body.classList.remove("detail");
-  document.getElementById("detailView").replaceChildren();
-  load();
+  $("detailView").replaceChildren();
+  $("saveState").replaceChildren();
+  renderList();                       // сразу из кэша — в нём уже все правки
   window.scrollTo(0, 0);
+  flushAll().then(load);              // свежие данные — когда правки долетели
 }
 async function openDetail(id) {
+  if (currentBlockId === id && detailEl) return;
+  if (selectionMode) setSelecting(false);
   let b = blocksCache.find(x => x.id === id);
-  if (!b) { try { blocksCache = await api("/blocks"); b = blocksCache.find(x => x.id === id); } catch (e) {} }
-  if (!b) { toast("Бригада не найдена", "error"); return; }
+  if (!b) { await load(); b = blocksCache.find(x => x.id === id); }
+  if (!b) {
+    if (loadState === "ok") toast("Бригада не найдена — возможно, её удалили", "error");
+    goList(); return;
+  }
   currentBlockId = id;
   document.body.classList.add("detail");
-  if (!(history.state && history.state.detail)) history.pushState({ detail: id }, "");
 
-  const dn = document.getElementById("detailName");
+  const dn = $("detailName");
   dn.value = b.name;
-  const saveName = debouncedSave(() => jpatch("/blocks/" + id, { name: dn.value }));
-  dn.oninput = saveName;
-  document.getElementById("detailDelete").onclick = async () => {
+  dn.oninput = () => {
+    const v = dn.value.trim();
+    if (!v) return;                     // пустое название сервер не примет
+    b.name = v;
+    saversFor(id).block.schedule();
+  };
+  dn.onblur = () => { if (!dn.value.trim()) dn.value = b.name; };
+  dn.onkeydown = e => { if (e.key === "Enter") dn.blur(); };
+  $("detailDelete").onclick = async () => {
     const ok = await confirmModal({ title: "Удалить бригаду?", message: `«${b.name || "без названия"}» и все её сохранённые ФИО будут удалены.`, okText: "Удалить", danger: true });
-    if (ok) {
-      try {
-        await api("/blocks/" + id, { method: "DELETE" });
-        draft.set(id, "");
-        toast("Бригада удалена", "ok"); showList();
-      } catch (e) { toast(e.message, "error"); }
-    }
+    if (!ok) return;
+    try {
+      await api("/blocks/" + id, { method: "DELETE" });
+      forgetBlock(id);
+      toast("Бригада удалена", "ok"); goList();
+    } catch (e) { toast(e.message, "error"); }
   };
 
-  document.getElementById("detailView").replaceChildren(buildDetail(b));
+  detailEl = buildDetail(b);
+  $("detailView").replaceChildren(detailEl);
   window.scrollTo(0, 0);
+
+  // Последняя отправка бригады: идущая — под наблюдение, завершённая — итогом.
+  const w = watchers.get(id);
+  if (w && w.job) renderJobPanel(detailEl, w.job);
+  try {
+    const job = await api(`/blocks/${id}/job`);
+    if (currentBlockId !== id || !job) return;
+    if (isActive(job)) watchJob(id, job);
+    else if (!watchers.has(id)) renderJobPanel(detailEl, job);
+  } catch (e) {}
 }
 
 function buildDetail(b) {
-  const el = document.getElementById("detailTpl").content.cloneNode(true).querySelector(".block");
+  const el = $("detailTpl").content.cloneNode(true).querySelector(".block");
+  const save = saversFor(b.id);
 
   const company = el.querySelector(".company");
   company.value = b.company || "";
-  const saveCompany = debouncedSave(() => jpatch("/blocks/" + b.id, { company: company.value }));
   company.addEventListener("input", () => {
     company.classList.remove("invalid");
     b.company = company.value;
-    saveCompany();
+    save.block.schedule();
     schedulePlan(el, b);
   });
 
@@ -305,22 +527,25 @@ function buildDetail(b) {
   workplace.addEventListener("input", () => {
     workplace.classList.remove("invalid");
     draft.set(b.id, workplace.value);
+    renderChips(el, b);
     schedulePlan(el, b);
   });
+  renderChips(el, b);
 
   setupSeg(el.querySelector(".seg.task"), b.task, v => {
     b.task = v;
-    jpatch("/blocks/" + b.id, { task: v }).catch(() => {});
+    save.block.schedule();
     schedulePlan(el, b);
   });
   setupSeg(el.querySelector(".seg.object"), b.object_key, v => {
     b.object_key = v;
-    jpatch("/blocks/" + b.id, { object_key: v }).catch(() => {});
+    save.block.schedule();
     schedulePlan(el, b);
   });
 
   const wbox = el.querySelector(".workers");
-  b.workers.forEach((w, i) => wbox.appendChild(renderWorker(el, b, w, i)));
+  (b.workers || []).forEach(w => wbox.appendChild(workerRow(el, b, w.full_name)));
+  syncWorkers(el, b, false);
 
   el.querySelector(".addWorker").addEventListener("click", () => addWorker(el, b));
   el.querySelector(".doSubmit").addEventListener("click", () => doSubmit(el, b));
@@ -336,79 +561,102 @@ function setupSeg(seg, value, onPick) {
   const active = buttons.find(btn => btn.dataset.v === value) || buttons[0];
   buttons.forEach(btn => {
     btn.type = "button";
+    btn.setAttribute("aria-pressed", btn === active ? "true" : "false");
     if (btn === active) btn.classList.add("active");
     btn.addEventListener("click", () => {
       if (btn.classList.contains("active")) return;
-      buttons.forEach(x => x.classList.remove("active"));
-      btn.classList.add("active");
+      buttons.forEach(x => { x.classList.remove("active"); x.setAttribute("aria-pressed", "false"); });
+      btn.classList.add("active"); btn.setAttribute("aria-pressed", "true");
       onPick(btn.dataset.v);
     });
   });
 }
 
-/* ---------- работники: правки без полной перерисовки ---------- */
-function renumber(wbox) {
-  [...wbox.children].forEach((row, i) => { row.querySelector(".num").textContent = (i + 1) + "."; });
+function renderChips(el, b) {
+  const box = el.querySelector(".recentWp");
+  const cur = el.querySelector(".workplace").value.trim();
+  const items = recentWp.get(b.id).filter(x => x !== cur);
+  box.replaceChildren(...items.map(v => {
+    const c = document.createElement("button");
+    c.type = "button"; c.className = "chip"; c.textContent = v; c.title = v;
+    c.addEventListener("click", () => {
+      const wp = el.querySelector(".workplace");
+      wp.value = v; wp.classList.remove("invalid");
+      draft.set(b.id, v);
+      renderChips(el, b); schedulePlan(el, b);
+    });
+    return c;
+  }));
 }
-function renderWorker(el, b, w, index) {
+
+/* ---------- работники ----------
+   Состав — это просто строки ввода. Любая правка (набор, добавление,
+   удаление) обновляет кэш и сохраняет весь список одним запросом. */
+function workerRow(el, b, name) {
   const div = document.createElement("div");
   div.className = "worker";
-  if (w.id != null) div.dataset.id = w.id;
   const num = document.createElement("div");
-  num.className = "num"; num.textContent = (index + 1) + ".";
+  num.className = "num";
   const inp = document.createElement("input");
-  inp.type = "text"; inp.value = w.full_name || ""; inp.placeholder = "Фамилия Имя Отчество";
-  inp.autocomplete = "off";
-  const save = debouncedSave(() => {
-    const id = div.dataset.id;
-    if (!id) return;                       // ещё создаётся — допишется по ответу POST
-    return jpatch("/workers/" + id, { full_name: inp.value });
+  inp.type = "text"; inp.value = name || ""; inp.placeholder = "Фамилия Имя Отчество";
+  inp.autocomplete = "off"; inp.spellcheck = false; inp.maxLength = 300;
+  inp.setAttribute("autocapitalize", "words");
+  inp.setAttribute("enterkeyhint", "next");
+  inp.setAttribute("aria-label", "ФИО работника");
+  inp.addEventListener("input", () => syncWorkers(el, b));
+  // Enter — к следующей строке, а с последней заполненной — новая строка:
+  // бригадир вводит ФИО подряд, не дотягиваясь до кнопки «Добавить».
+  inp.addEventListener("keydown", e => {
+    if (e.key !== "Enter" || e.isComposing) return;
+    e.preventDefault();
+    const next = div.nextElementSibling;
+    if (next) next.querySelector("input").focus();
+    else if (inp.value.trim()) addWorker(el, b);
   });
-  inp.addEventListener("input", () => { save(); schedulePlan(el, b); });
   const del = document.createElement("button");
-  del.className = "icon"; del.type = "button"; del.innerHTML = ICONS.close; del.title = "Удалить";
-  del.addEventListener("click", async () => {
-    const id = div.dataset.id;
-    const wbox = div.parentElement;
-    save.cancel();                         // не сохранять ФИО удалённой строки
-    div.remove(); renumber(wbox); schedulePlan(el, b);
-    if (!id) return;
-    try { await api("/workers/" + id, { method: "DELETE" }); }
-    catch (e) { toast("Не удалось удалить: " + e.message, "error"); refreshDetail(); }
-  });
-  div.appendChild(num); div.appendChild(inp); div.appendChild(del);
+  del.className = "icon"; del.type = "button"; del.innerHTML = ICONS.close;
+  del.title = "Удалить"; del.setAttribute("aria-label", "Удалить работника");
+  del.addEventListener("click", () => removeWorker(el, b, div));
+  div.append(num, inp, del);
   return div;
 }
-function addWorker(el, b) {
-  const wbox = el.querySelector(".workers");
-  const btn = el.querySelector(".addWorker");
-  // Строку показываем сразу, не дожидаясь сервера: бригадир вводит ФИО
-  // подряд, и ожидание ответа на каждом «плюсе» ощущается как тормоза.
-  const row = renderWorker(el, b, { id: null, full_name: "" }, wbox.children.length);
-  wbox.appendChild(row);
-  row.querySelector("input").focus();
-  btn.disabled = true;
-  const create = jpost("/blocks/" + b.id + "/workers", { full_name: "" })
-    .then(blk => {
-      b.workers = blk.workers;
-      const created = blk.workers[blk.workers.length - 1];
-      if (!created) return;
-      if (!row.isConnected) {   // строку удалили, пока шёл запрос — убираем и на сервере
-        return api("/workers/" + created.id, { method: "DELETE" }).catch(() => {});
-      }
-      row.dataset.id = created.id;
-      const typed = row.querySelector("input").value;
-      if (typed) return jpatch("/workers/" + created.id, { full_name: typed });
-    })
-    .catch(e => { row.remove(); renumber(wbox); toast(e.message, "error"); })
-    .finally(() => { btn.disabled = false; pendingCreates.delete(create); });
-  pendingCreates.add(create);
+function syncWorkers(el, b, save = true) {
+  const rows = [...el.querySelectorAll(".worker")];
+  const seen = new Set();
+  b.workers = rows.map((row, i) => {
+    row.querySelector(".num").textContent = (i + 1) + ".";
+    const inp = row.querySelector("input");
+    const key = normName(inp.value);
+    const dup = !!key && seen.has(key);
+    seen.add(key);
+    inp.classList.toggle("dup", dup);
+    inp.title = dup ? "Это ФИО уже есть выше — форма на него уйдёт дважды" : "";
+    return { full_name: inp.value };
+  });
+  if (save) saversFor(b.id).workers.schedule();
+  schedulePlan(el, b);
 }
-async function refreshDetail() {
-  try { blocksCache = await api("/blocks"); } catch (e) { return; }
-  const b = blocksCache.find(x => x.id === currentBlockId);
-  if (!b) return;
-  document.getElementById("detailView").replaceChildren(buildDetail(b));
+function addWorker(el, b, name = "", index = null) {
+  const wbox = el.querySelector(".workers");
+  const row = workerRow(el, b, name);
+  wbox.insertBefore(row, index == null ? null : (wbox.children[index] || null));
+  syncWorkers(el, b, !!name);
+  if (!name) row.querySelector("input").focus();
+}
+function removeWorker(el, b, row) {
+  const name = row.querySelector("input").value.trim();
+  const index = [...row.parentElement.children].indexOf(row);
+  row.remove();
+  syncWorkers(el, b);
+  if (!name) return;
+  toast(`Удалён: ${name}`, "info", 5000, { label: "Вернуть", run: () => {
+    if (el.isConnected) { addWorker(el, b, name, index); return; }
+    const cur = blocksCache.find(x => x.id === b.id);
+    if (!cur) return;
+    cur.workers.splice(Math.min(index, cur.workers.length), 0, { full_name: name });
+    saversFor(b.id).workers.schedule();
+    renderList();
+  } });
 }
 
 /* ---------- плашка «что программа впишет в форму» ---------- */
@@ -489,9 +737,9 @@ async function renderPlan(el, b) {
       parts.push(planRow(item.q, tag, raw, item.note, "— не заполнено —"));
     }
   }
+  const rest = answersTpl.pages.reduce((s, p) => s + p.items.length, 0) - 1;
   parts.push(`<div class="plan-legend">Формы отправляются по одной на каждого работника — `
-    + `меняется только ФИО, остальные ${answersTpl.pages.reduce((s, p) => s + p.items.length, 0) - 1} `
-    + `${plural(answersTpl.pages.reduce((s, p) => s + p.items.length, 0) - 1, "поле", "поля", "полей")} одинаковы.</div>`);
+    + `меняется только ФИО, остальные ${rest} ${plural(rest, "поле", "поля", "полей")} одинаковы.</div>`);
   body.innerHTML = parts.join("");
 }
 // Разворачивание длинных значений — одним слушателем на документ.
@@ -504,7 +752,15 @@ document.addEventListener("click", e => {
 });
 
 /* ---------- отправка ---------- */
+const SUBMIT_TEXT = "Отправить за всю бригаду";
+function setSubmitState(el, busyText) {
+  const btn = el.querySelector(".doSubmit");
+  btn.disabled = !!busyText;
+  btn.textContent = busyText || SUBMIT_TEXT;
+}
 async function doSubmit(el, b) {
+  const w = watchers.get(b.id);
+  if (w && (!w.job || isActive(w.job))) { toast("По этой бригаде отправка уже идёт", "info"); return; }
   const wpEl = el.querySelector(".workplace");
   const companyEl = el.querySelector(".company");
   const workplace = wpEl.value.trim();
@@ -517,36 +773,153 @@ async function doSubmit(el, b) {
   if (!task || !object_key) { toast("Выберите тип работ и объект", "error"); return; }
   const names = [...el.querySelectorAll(".worker input")].map(i => i.value.trim()).filter(Boolean);
   if (!names.length) { toast("В бригаде нет ни одного ФИО", "error"); return; }
+  const seen = new Set(), dups = new Set();
+  names.forEach(n => { const k = normName(n); if (seen.has(k)) dups.add(n); seen.add(k); });
 
+  const n = names.length;
   const ok = await confirmModal({
     title: "Отправить форму SLAM?",
-    message: "Будет отправлена реальная форма на каждого работника бригады.",
+    message: `Уйдёт ${n} ${plural(n, "реальная форма", "реальные формы", "реальных форм")} — по одной на каждого. Проверьте состав:`,
+    list: names,
+    warning: dups.size ? `Повторяется: ${[...dups].join(", ")} — на ${dups.size > 1 ? "них" : "него"} форма уйдёт дважды.` : "",
     summaryRows: [
-      ["Работников", String(names.length)],
       ["Тип работ", taskLabel(task)],
       ["Объект", objLabel(object_key)],
       ["Подрядчик", company],
       ["Рабочее место", workplace],
     ],
-    okText: `Отправить (${names.length})`,
+    okText: `Отправить (${n})`,
   });
   if (!ok) return;
 
-  const btn = el.querySelector(".doSubmit");
-  btn.disabled = true; btn.textContent = "Запуск…";
-  const pw = el.querySelector(".progressWrap"); pw.style.display = "block";
-  pw.scrollIntoView({ behavior: "smooth", block: "nearest" });
-
+  setSubmitState(el, "Запуск…");
   try {
-    // Критично: ФИО бэкенд читает из БД. Дожидаемся всех отложенных сохранений,
-    // иначе только что набранное имя уйдёт в форму в старой редакции.
-    await flushSaves();
-    const job = await jpost("/blocks/" + b.id + "/submit", { workplace, submit: true, task, object_key, company });
-    pollJob(job.id, el, btn);
+    // Состав уходит в самом запросе: сервер сохранит и отправит ровно его,
+    // даже если отложенное сохранение ФИО ещё не долетело.
+    const job = await jpost("/blocks/" + b.id + "/submit", { workplace, submit: true, task, object_key, company, names });
+    recentWp.add(b.id, workplace);
+    if (el.isConnected) renderChips(el, b);
+    watchJob(b.id, job);
+    el.querySelector(".progressWrap").scrollIntoView({ behavior: "smooth", block: "nearest" });
   } catch (e) {
-    toast("Ошибка запуска: " + e.message, "error", 5000);
-    btn.disabled = false; btn.textContent = "Отправить за всю бригаду";
+    // 409 — отправка уже идёт; сеть — запрос мог дойти, а ответ потеряться.
+    // В обоих случаях сначала ищем задачу на сервере, а не шлём повторно.
+    if (e.status === 409 || e.network) {
+      const job = await api(`/blocks/${b.id}/job`).catch(() => null);
+      if (job && isActive(job)) {
+        watchJob(b.id, job);
+        toast("Отправка по этой бригаде уже идёт — показываю её ход", "info", 5000);
+        return;
+      }
+    }
+    if (el.isConnected) setSubmitState(el, null);
+    toast("Ошибка запуска: " + e.message, "error", 6000);
   }
+}
+
+/* ---------- отправки: наблюдение ----------
+   Задача живёт на сервере и от вкладки не зависит: свернули приложение,
+   закрыли вкладку — формы продолжают уходить. Клиент только наблюдает, и
+   наблюдает упорно: сбой сети (типичный, когда телефон выходит из фона) —
+   не повод бросать, а повод повторить позже. Наблюдение привязано к
+   бригаде, а не к экрану: уход в список и обратно его не обрывает. */
+const watchers = new Map();       // blockId -> { id, job, timer, fails, inflight }
+const pendingNotices = [];        // итоги, пришедшие, пока вкладка была скрыта
+const isActive = j => !!j && (j.status === "queued" || j.status === "running");
+const summarize = j => ({
+  id: j.id, status: j.status, submit: j.submit, total: j.total, done: j.done,
+  sent: j.results.filter(r => r.submitted).length,
+  failed: j.results.filter(r => r.status === "failed").length,
+  unconfirmed: j.results.filter(r => r.status === "unconfirmed").length,
+  created_at: j.created_at, finished_at: j.finished_at,
+});
+
+function watchJob(blockId, job) {
+  let w = watchers.get(blockId);
+  if (!w || w.id !== job.id) {
+    if (w) clearTimeout(w.timer);
+    w = { id: job.id, job: null, timer: null, fails: 0, inflight: false };
+    watchers.set(blockId, w);
+  }
+  if (job.results) { w.job = job; applyJob(blockId, job); }
+  if (!job.results || isActive(job)) schedulePoll(blockId, job.results ? 1500 : 0);
+  else watchers.delete(blockId);
+}
+function schedulePoll(blockId, ms) {
+  const w = watchers.get(blockId);
+  if (!w) return;
+  clearTimeout(w.timer);
+  w.timer = setTimeout(() => pollJob(blockId), ms);
+}
+async function pollJob(blockId) {
+  const w = watchers.get(blockId);
+  if (!w || w.inflight) return;
+  clearTimeout(w.timer);
+  w.inflight = true;
+  let j;
+  try {
+    j = await api("/jobs/" + w.id);
+  } catch (e) {
+    w.inflight = false;
+    if (watchers.get(blockId) !== w) return;
+    if (e.status === 404) { watchers.delete(blockId); jobLost(blockId); return; }
+    w.fails++;
+    if (w.job) applyJob(blockId, w.job, { offline: true });
+    schedulePoll(blockId, Math.min(15000, 1500 * 2 ** Math.min(w.fails, 4)));
+    return;
+  }
+  w.inflight = false;
+  if (watchers.get(blockId) !== w) return;
+  const was = w.job;
+  w.fails = 0; w.job = j;
+  applyJob(blockId, j);
+  if (isActive(j)) { schedulePoll(blockId, document.hidden ? 10000 : 1500); return; }
+  watchers.delete(blockId);
+  updateTitle();
+  if (!was || isActive(was)) announceDone(blockId, j);
+}
+const pokeWatchers = () => { for (const id of [...watchers.keys()]) pollJob(id); };
+
+function applyJob(blockId, job, opts = {}) {
+  const b = blocksCache.find(x => x.id === blockId);
+  if (b) b.last_job = summarize(job);
+  const row = document.querySelector(`#listView .row[data-id="${blockId}"]`);
+  if (row) paintRowJob(row, b && b.last_job);
+  if (currentBlockId === blockId && detailEl) renderJobPanel(detailEl, job, opts);
+  updateTitle();
+}
+function jobLost(blockId) {
+  updateTitle();
+  if (currentBlockId === blockId && detailEl) {
+    setSubmitState(detailEl, null);
+    detailEl.querySelector(".progressText").textContent =
+      "Сервер больше не знает об этой отправке (он перезапускался). Проверьте ответы в самой форме, прежде чем отправлять снова.";
+  }
+}
+function announceDone(blockId, job) {
+  const b = blocksCache.find(x => x.id === blockId);
+  const name = b ? b.name : job.block_name;
+  const s = summarize(job);
+  let msg;
+  if (!job.submit) msg = `«${name}»: проверка без отправки завершена`;
+  else {
+    msg = `${job.status === "error" ? "Прервано" : "Готово"} — «${name}»: отправлено ${s.sent} из ${s.total}`;
+    if (s.failed) msg += `, с ошибкой ${s.failed}`;
+    if (s.unconfirmed) msg += `, без подтверждения ${s.unconfirmed}`;
+  }
+  const bad = job.status === "error" || s.failed || s.unconfirmed;
+  const show = () => {
+    toast(msg, bad ? "error" : "ok", 7000);
+    if (navigator.vibrate) navigator.vibrate(bad ? [80, 60, 80] : 60);
+  };
+  if (document.hidden) pendingNotices.push(show); else show();
+}
+const BASE_TITLE = document.title;
+function updateTitle() {
+  const act = [...watchers.values()].map(w => w.job).filter(isActive);
+  if (!act.length) { document.title = BASE_TITLE; return; }
+  const done = act.reduce((s, j) => s + j.done, 0), total = act.reduce((s, j) => s + j.total, 0);
+  document.title = `(${done}/${total}) SLAM — отправка`;
 }
 
 const RES_LABEL = {
@@ -557,6 +930,40 @@ const RES_LABEL = {
   running: ["running", ICONS.spin, "заполняется…"],
   pending: ["", ICONS.clock, "ожидает"],
 };
+function etaText(job) {
+  const fin = job.results.filter(r => r.elapsed > 0);
+  const avg = fin.length ? fin.reduce((s, r) => s + r.elapsed, 0) / fin.length : 10;
+  const sec = Math.round(Math.max(0, job.total - job.done) * avg);
+  return sec >= 90 ? `~${Math.round(sec / 60)} мин` : `~${Math.max(5, sec)} с`;
+}
+function renderJobPanel(el, job, opts = {}) {
+  const pw = el.querySelector(".progressWrap");
+  pw.hidden = false;
+  const active = isActive(job);
+  const s = summarize(job);
+  el.querySelector(".job-title").textContent = active
+    ? (job.status === "queued" ? "В очереди" : "Идёт отправка")
+    : (job.submit ? "Последняя отправка" : "Последняя проверка (без отправки)");
+  el.querySelector(".job-when").textContent = fmtWhen(job.finished_at || job.started_at || job.created_at);
+  el.querySelector(".fill").style.width = (job.total ? Math.round(job.done / job.total * 100) : 0) + "%";
+  let text;
+  if (active && opts.offline) text = "Нет связи с сервером. Отправка идёт там и без телефона — обновлю, как только связь вернётся.";
+  else if (job.status === "queued") text = "Ждёт, пока сервер закончит отправку другой бригады.";
+  else if (active) text = `Обработано ${job.done} из ${job.total} • осталось ${etaText(job)}`;
+  else if (!job.submit) text = `Проверено ${job.done} из ${job.total}, в форму ничего не отправлялось.`;
+  else {
+    const bits = [`отправлено ${s.sent} из ${s.total}`];
+    if (s.failed) bits.push(`с ошибкой ${s.failed}`);
+    if (s.unconfirmed) bits.push(`без подтверждения ${s.unconfirmed}`);
+    text = (job.status === "error" ? "Прервано: " : "Готово: ") + bits.join(", ");
+  }
+  const pt = el.querySelector(".progressText");
+  pt.textContent = text;
+  pt.classList.toggle("offline", !!(active && opts.offline));
+  el.querySelector(".job-note").hidden = !active;
+  renderResults(el.querySelector(".results"), job.results, job.id);
+  setSubmitState(el, active ? (job.status === "queued" ? "В очереди…" : `Идёт отправка… ${job.done}/${job.total}`) : null);
+}
 
 /* Обновление списка результатов на месте: полная перерисовка каждые полторы
    секунды схлопывала раскрытые плашки и заметно дёргала экран. */
@@ -571,7 +978,9 @@ function renderResults(rbox, results, jobId) {
     }
     const key = r.status === "ok" && !r.submitted ? "filled" : (RES_LABEL[r.status] ? r.status : "pending");
     const [cls, icon, label] = RES_LABEL[key];
-    const sig = [r.status, r.submitted, r.elapsed, (r.errors || []).length, (r.warnings || []).length,
+    // В подписи — задача и ФИО: иначе строка от прошлой отправки с тем же
+    // статусом «ожидает» не перерисовалась бы под нового работника.
+    const sig = [jobId, r.full_name, r.status, r.submitted, r.elapsed, (r.errors || []).length, (r.warnings || []).length,
                  r.fields_verified, r.fields_total, (r.steps || []).length].join("|");
     if (node._sig === sig) return;
     node._sig = sig;
@@ -642,75 +1051,46 @@ function buildWrittenPanel(jobId, index, r) {
   return det;
 }
 
-async function pollJob(jobId, el, btn) {
-  const fill = el.querySelector(".fill");
-  const ptext = el.querySelector(".progressText");
-  const rbox = el.querySelector(".results");
-  let timer = null, stopped = false;
-
-  const stop = () => { stopped = true; clearTimeout(timer); document.removeEventListener("visibilitychange", onVis); };
-  const onVis = () => { if (!document.hidden && !stopped) { clearTimeout(timer); tick(); } };
-  document.addEventListener("visibilitychange", onVis);
-
-  const tick = async () => {
-    if (stopped || !document.body.contains(el)) { stop(); return; }
-    // В фоне вкладка всё равно не отрисовывается — не жжём батарею и трафик.
-    if (document.hidden) { timer = setTimeout(tick, 5000); return; }
-
-    let j;
-    try { j = await api("/jobs/" + jobId); }
-    catch (e) {
-      toast("Потеряна связь с задачей: " + e.message, "error");
-      if (document.body.contains(btn)) { btn.disabled = false; btn.textContent = "Отправить за всю бригаду"; }
-      stop(); return;
-    }
-
-    fill.style.width = (j.total ? Math.round(j.done / j.total * 100) : 0) + "%";
-    const statusRu = { queued: "в очереди", running: "выполняется", done: "готово", error: "ошибка" }[j.status] || j.status;
-    ptext.textContent = `Обработано ${j.done} из ${j.total} • ${statusRu}`;
-    renderResults(rbox, j.results, jobId);
-
-    if (j.status === "done" || j.status === "error") {
-      btn.disabled = false; btn.textContent = "Отправить за всю бригаду";
-      const okCount = j.results.filter(r => r.submitted).length;
-      const failCount = j.results.filter(r => r.status === "failed").length;
-      const unconf = j.results.filter(r => r.status === "unconfirmed").length;
-      if (failCount || unconf) {
-        const bits = [`отправлено ${okCount}`];
-        if (failCount) bits.push(`с ошибкой ${failCount}`);
-        if (unconf) bits.push(`без подтверждения ${unconf}`);
-        toast("Готово: " + bits.join(", "), "error", 6000);
-      } else {
-        toast(`Готово: отправлено ${okCount} из ${j.total}`, "ok", 5000);
-      }
-      stop(); return;
-    }
-    timer = setTimeout(tick, 1500);
-  };
-  tick();
-}
-
 /* ---------- глобальные кнопки ---------- */
-document.getElementById("addBlock").addEventListener("click", async () => {
-  const name = await promptModal({ title: "Новая бригада", label: "Название блока (бригады)", value: "Бригада", placeholder: "Например: Бригада Иванова" });
+$("addBlock").addEventListener("click", async () => {
+  const name = await promptModal({ title: "Новая бригада", label: "Название бригады", value: "Бригада", placeholder: "Например: Бригада Иванова" });
   if (name === null) return;
   try {
     const nb = await jpost("/blocks", { name });
     blocksCache.push(nb);
+    renderList();
     toast("Бригада создана", "ok");
-    openDetail(nb.id);     // сразу открываем её форму, выйти можно кнопкой «Назад»
+    goDetail(nb.id);     // сразу открываем её форму, выйти можно кнопкой «Назад»
   } catch (e) { toast(e.message, "error"); }
 });
+$("backBtn").addEventListener("click", goList);
+$("saveState").addEventListener("click", () => flushAll());
+$("selCancel").addEventListener("click", () => setSelecting(false));
+$("selDelete").addEventListener("click", deleteSelected);
 
-document.getElementById("backBtn").addEventListener("click", () => {
-  if (history.state && history.state.detail) history.back();   // вызовет popstate -> showList
-  else showList();
+window.addEventListener("hashchange", route);
+// системная «Назад» в режиме выбора выходит из выбора
+window.addEventListener("popstate", () => {
+  if (selectionMode && !(history.state && history.state.sel)) setSelecting(false);
 });
-document.getElementById("selCancel").addEventListener("click", () => setSelecting(false));
-document.getElementById("selDelete").addEventListener("click", deleteSelected);
 
-// аппаратная/браузерная «Назад» возвращает к списку, а не закрывает приложение
-window.addEventListener("popstate", () => { if (document.body.classList.contains("detail")) showList(); });
+/* ---------- жизненный цикл страницы ----------
+   Свернули приложение или закрывают вкладку — дописываем правки сразу.
+   Вернулись — сразу обновляем отправки, не дожидаясь таймера, и показываем
+   итоги, пришедшие, пока нас не было. */
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { flushAll(true); return; }
+  pendingNotices.splice(0).forEach(show => show());
+  pokeWatchers();
+  if (currentBlockId == null) load();
+});
+window.addEventListener("pagehide", () => flushAll(true));
+window.addEventListener("online", () => { pokeWatchers(); flushAll(); });
+window.addEventListener("pageshow", e => { if (e.persisted) { pokeWatchers(); load(); } });
+window.addEventListener("beforeunload", e => {
+  flushAll(true);
+  if ([...savers].some(s => s.failed)) { e.preventDefault(); e.returnValue = ""; }
+});
 
-load();
+route();
 ensureAnswersTemplate();

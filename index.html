@@ -20,6 +20,7 @@
     --barbg:#131c25;
   }
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  [hidden] { display:none !important; }
   html,body { margin:0; }
   html { -webkit-text-size-adjust:100%; text-size-adjust:100%; }
   body {
@@ -43,7 +44,9 @@
     position:sticky; top:0; z-index:20; border-bottom:1px solid var(--line);
     display:flex; justify-content:space-between; align-items:center; gap:12px;
   }
-  header .brand { display:flex; align-items:center; gap:10px; }
+  header .brand { display:flex; align-items:center; gap:10px; min-width:0; }
+  header h1 { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #addBlock { white-space:nowrap; flex:none; }
   header .logo { width:30px; height:30px; border-radius:8px; flex:none;
     background:linear-gradient(135deg,var(--accent),var(--blue)); display:grid; place-items:center;
     font-weight:800; font-size:14px; color:#fff; }
@@ -123,7 +126,16 @@
   .workers { margin-bottom:8px; }
   .worker { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
   .worker .num { width:22px; text-align:center; color:var(--muted2); font-size:13px; flex:none; }
-  .worker input { flex:1; }
+  .worker input { flex:1; min-width:0; }
+  .worker input.dup { border-color:var(--warn); box-shadow:0 0 0 3px rgba(217,164,65,.15); }
+
+  /* недавние рабочие места — подставить в один тап */
+  .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .chips:empty { display:none; }
+  .chip { background:var(--bg2); border:1px solid var(--line); color:var(--muted); font-weight:500;
+    font-size:13px; padding:7px 11px; border-radius:16px; max-width:100%;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .chip:hover, .chip:active { background:var(--card2); color:var(--text); }
 
   .divider { height:1px; background:var(--line); margin:16px -16px; }
 
@@ -171,6 +183,12 @@
 
   /* прогресс */
   .progressWrap { margin-top:14px; padding-top:14px; border-top:1px dashed var(--line); }
+  .job-head { display:flex; align-items:baseline; gap:8px; }
+  .job-title { font-weight:650; font-size:15px; }
+  .job-when { margin-left:auto; font-size:12px; color:var(--muted2); white-space:nowrap; }
+  .progressText.offline { color:var(--warn); }
+  .job-note { font-size:12.5px; color:var(--muted); margin-top:8px; padding:9px 11px; line-height:1.5;
+    background:var(--bg2); border:1px dashed var(--line2); border-radius:9px; }
   .bar { height:8px; background:var(--bg2); border-radius:6px; overflow:hidden; margin:8px 0; }
   .bar > div { height:100%; background:linear-gradient(90deg,var(--accent),var(--blue)); width:0%;
     transition:width .3s linear; }
@@ -210,6 +228,10 @@
   .modal .summary div { display:flex; justify-content:space-between; gap:10px; padding:3px 0; }
   .modal .summary b { color:var(--text); font-weight:600; text-align:right; overflow-wrap:anywhere; }
   .modal .summary span { color:var(--muted); flex:none; }
+  .modal ol.names { margin:0 0 10px; padding:9px 12px 9px 34px; background:var(--bg2);
+    border:1px solid var(--line); border-radius:10px; font-size:14px; max-height:32vh; overflow-y:auto; }
+  .modal ol.names li { padding:2px 0; overflow-wrap:anywhere; }
+  .modal .m-warn { color:var(--warn); font-size:13px; margin:0 0 10px; }
 
   /* тосты */
   #toasts { position:fixed; left:0; right:0; z-index:60; display:flex;
@@ -222,6 +244,10 @@
   @keyframes rise { from{opacity:0; transform:translateY(8px)} to{opacity:1; transform:none} }
   .toast.ok { border-left-color:var(--accent); }
   .toast.err { border-left-color:var(--danger); }
+  .toast { display:flex; align-items:center; gap:10px; pointer-events:auto; }
+  .toast .t-msg { flex:1; min-width:0; overflow-wrap:anywhere; }
+  .toast .t-act { background:transparent; color:var(--blue-h); padding:6px 8px; font-size:14px; flex:none; }
+  .toast .t-act:hover, .toast .t-act:active { background:var(--card); }
 
   /* ---- detail-бар (экран одной бригады) ---- */
   #detailBar { display:none; position:sticky; top:0; z-index:20;
@@ -239,6 +265,14 @@
   #detailBar .dname { flex:1; font-size:17px; font-weight:650; background:transparent; border:none;
     color:var(--text); padding:8px 6px; border-radius:8px; min-width:0; }
   #detailBar .dname:focus { background:var(--bg2); outline:1px solid var(--line2); }
+  /* индикатор сохранения: иконка, чтобы не отъедать ширину у названия;
+     текст — только когда что-то не сохранилось */
+  #saveState { display:inline-flex; align-items:center; gap:5px; flex:none; font-size:12px;
+    color:var(--muted2); white-space:nowrap; transition:opacity .4s; }
+  #saveState svg { width:16px; height:16px; }
+  #saveState.ok { color:var(--accent); }
+  #saveState.idle { opacity:0; }
+  #saveState.err { color:var(--danger); font-weight:600; cursor:pointer; }
 
   /* ---- список бригад (главный экран) ---- */
   .row {
@@ -261,6 +295,16 @@
   .row .row-name { font-size:16px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .row .row-sub { font-size:12.5px; color:var(--muted2); margin-top:3px;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .row .row-job { display:flex; align-items:center; gap:5px; font-size:12px; font-weight:600;
+    color:var(--muted2); margin-top:6px; min-width:0; }
+  .row .row-job span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .row .row-job svg { width:14px; height:14px; flex:none; }
+  .row .row-job.ok { color:var(--accent); }
+  .row .row-job.warn { color:var(--warn); }
+  .row .row-job.bad { color:var(--danger); }
+  .row .row-job.run { color:var(--blue-h); }
+  .row:focus-visible { outline:2px solid var(--blue); outline-offset:2px; }
+  .empty .retry { margin-top:14px; }
   .row .row-chevron { color:var(--muted2); flex:none; display:flex; }
   .row .row-chevron svg { width:20px; height:20px; }
   body.selecting .row .row-chevron { display:none; }
@@ -275,6 +319,7 @@
     .card { padding:14px; border-radius:12px; }
     header h1 { font-size:15px; }
     header .sub { display:none; }
+    header .h1-tail { display:none; }
     .seg button { padding:11px 6px; font-size:14px; }
     .divider { margin:14px -14px; }
     .modal { padding:18px; border-radius:14px; }
@@ -290,19 +335,20 @@
   <div class="brand">
     <div class="logo">SL</div>
     <div>
-      <h1>SLAM — автозаполнение</h1>
+      <h1>SLAM<span class="h1-tail"> — автозаполнение</span></h1>
       <div class="sub">оценка рисков · заполнение за бригаду</div>
     </div>
   </div>
-  <button id="addBlock" type="button">+ Блок</button>
+  <button id="addBlock" type="button">+ Бригада</button>
 </header>
 
 <div id="detailBar">
-  <button class="back" id="backBtn" type="button" title="Назад">
+  <button class="back" id="backBtn" type="button" title="Назад" aria-label="Назад к списку бригад">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>
   </button>
-  <input class="dname" id="detailName" type="text" placeholder="Название бригады">
-  <button class="icon" id="detailDelete" type="button" title="Удалить бригаду">
+  <input class="dname" id="detailName" type="text" placeholder="Название бригады" maxlength="200" aria-label="Название бригады">
+  <span id="saveState" role="status" aria-live="polite"></span>
+  <button class="icon" id="detailDelete" type="button" title="Удалить бригаду" aria-label="Удалить бригаду">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6"/></svg>
   </button>
 </div>
@@ -324,13 +370,14 @@
 <div id="toasts"></div>
 
 <template id="rowTpl">
-  <div class="row">
+  <div class="row" role="button" tabindex="0">
     <span class="row-check">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4 4L19 7"/></svg>
     </span>
     <div class="row-main">
       <div class="row-name"></div>
       <div class="row-sub"></div>
+      <div class="row-job" hidden></div>
     </div>
     <span class="row-chevron">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
@@ -341,7 +388,7 @@
 <template id="detailTpl">
   <div class="card block">
     <label>Подрядная организация <span class="hint" style="display:inline">— сохраняется</span></label>
-    <input class="company" type="text" placeholder="Например: ТОО «СтройМонтаж»">
+    <input class="company" type="text" placeholder="Например: ТОО «СтройМонтаж»" maxlength="300">
 
     <label>Тип работ <span class="muted">(вопрос 3)</span></label>
     <div class="seg task">
@@ -356,7 +403,8 @@
     </div>
 
     <label>Наименование рабочего места <span class="req">*</span></label>
-    <textarea class="workplace" placeholder="Где именно проводятся работы"></textarea>
+    <textarea class="workplace" placeholder="Где именно проводятся работы" maxlength="1000"></textarea>
+    <div class="chips recentWp" aria-label="Недавние рабочие места"></div>
     <div class="hint">Меняется каждый раз. Сохраняется только на этом устройстве.</div>
 
     <div class="divider"></div>
@@ -377,9 +425,12 @@
     <div style="height:14px"></div>
     <button class="green doSubmit">Отправить за всю бригаду</button>
 
-    <div class="progressWrap" style="display:none">
+    <div class="progressWrap" hidden>
+      <div class="job-head"><span class="job-title"></span><span class="job-when"></span></div>
       <div class="bar"><div class="fill"></div></div>
-      <div class="muted progressText"></div>
+      <div class="muted progressText" aria-live="polite"></div>
+      <div class="job-note" hidden>Отправка идёт на сервере — телефон можно убрать, приложение свернуть
+        или закрыть. Ход и итог будут здесь, когда вернётесь.</div>
       <div class="results"></div>
     </div>
   </div>
